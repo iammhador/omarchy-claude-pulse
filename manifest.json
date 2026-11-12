@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.iammhador.claude-pulse",
+  "name": "Claude Pulse",
+  "version": "1.4.1",
+  "author": "iammhador",
+  "license": "MIT",
+  "description": "Claude Code in the Omarchy bar: plan limits with pace, every running session with what it is doing now, approvals, model, tokens, cost, subagents and context; a tune when Claude finishes; clickable alerts; a quick prompt launcher with pinned projects; background jobs; 30-day stats; searchable history with one-click resume; and a health check for updates, sign-in and MCP servers.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Claude Pulse",
+    "description": "Claude plan usage, live Claude Code sessions, stats and history.",
+    "category": "Productivity",
+    "aliases": [
+      "claude",
+      "claude code",
+      "ai usage",
+      "sessions",
+      "anthropic"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "colorScheme": "claude",
+      "barWindow": "session",
+      "showPercent": true,
+      "showWaitingCount": true,
+      "pulse": true,
+      "colorBar": true,
+      "contextual": false,
+      "pollMs": 1500,
+      "usageIntervalSec": 300,
+      "alertWaiting": true,
+      "waitingDelaySec": 10,
+      "finishedAfterSec": 120,
+      "alertLimits": true,
+      "statusCheck": true,
+      "costEstimates": true,
+      "sounds": true,
+      "soundFinished": "claude",
+      "soundNeedsYou": "claude",
+      "soundWarning": "claude",
+      "soundVolume": 70,
+      "alertContext": true,
+      "contextWarnPct": 80,
+      "alertJobs": true,
+      "editor": "auto"
+    },
+    "schema": [
+      {
+        "key": "colorScheme",
+        "type": "string",
+        "label": "Colours: claude (Claude's own palette) or theme (your Omarchy theme)",
+        "defaultValue": "claude"
+      },
+      {
+        "key": "barWindow",
+        "type": "string",
+        "label": "Limit shown on the bar: session or weekly",
+        "defaultValue": "session"
+      },
+      {
+        "key": "showPercent",
+        "type": "boolean",
+        "label": "Show the usage percentage next to the icon",
+        "defaultValue": true
+      },
+      {
+        "key": "showWaitingCount",
+        "type": "boolean",
+        "label": "Show how many sessions are waiting for you",
+        "defaultValue": true
+      },
+      {
+        "key": "pulse",
+        "type": "boolean",
+        "label": "Pulse the icon when a session needs you",
+        "defaultValue": true
+      },
+      {
+        "key": "colorBar",
+        "type": "boolean",
+        "label": "Colour the icon by usage (green to red)",
+        "defaultValue": true
+      },
+      {
+        "key": "contextual",
+        "type": "boolean",
+        "label": "Hide the icon while no session is running",
+        "defaultValue": false
+      },
+      {
+        "key": "pollMs",
+        "type": "number",
+        "label": "How often to check sessions, in ms (750-10000)",
+        "defaultValue": 1500
+      },
+      {
+        "key": "usageIntervalSec",
+        "type": "number",
+        "label": "How often to fetch plan usage, in seconds (300-3600)",
+        "defaultValue": 300
+      },
+      {
+        "key": "alertWaiting",
+        "type": "boolean",
+        "label": "Show an alert card when a session finishes or needs you",
+        "defaultValue": true
+      },
+      {
+        "key": "waitingDelaySec",
+        "type": "number",
+        "label": "Seconds a session must wait before the notification",
+        "defaultValue": 10
+      },
+      {
+        "key": "finishedAfterSec",
+        "type": "number",
+        "label": "A run this long (seconds) counts as a finished task",
+        "defaultValue": 120
+      },
+      {
+        "key": "alertLimits",
+        "type": "boolean",
+        "label": "Notify at 75% and 90% of a limit, and when it resets",
+        "defaultValue": true
+      },
+      {
+        "key": "statusCheck",
+        "type": "boolean",
+        "label": "Check status.claude.com for incidents",
+        "defaultValue": true
+      },
+      {
+        "key": "costEstimates",
+        "type": "boolean",
+        "label": "Show API-equivalent cost estimates",
+        "defaultValue": true
+      },
+      {
+        "key": "sounds",
+        "type": "boolean",
+        "label": "Play sounds (finished tune, needs-you chime, warnings)",
+        "defaultValue": true
+      },
+      {
+        "key": "soundFinished",
+        "type": "string",
+        "label": "Finished tune: claude, claude-marimba or claude-glass (Claude Pulse's own), a freedesktop sound name, a file path, or none",
+        "defaultValue": "claude"
+      },
+      {
+        "key": "soundNeedsYou",
+        "type": "string",
+        "label": "Needs-you sound: claude, claude-marimba, claude-glass, a sound name, a file path, or none",
+        "defaultValue": "claude"
+      },
+      {
+        "key": "soundWarning",
+        "type": "string",
+        "label": "Warning sound: claude, claude-marimba, claude-glass, a sound name, a file path, or none",
+        "defaultValue": "claude"
+      },
+      {
+        "key": "soundVolume",
+        "type": "number",
+        "label": "Sound volume (0-100)",
+        "defaultValue": 70
+      },
+      {
+        "key": "alertContext",
+        "type": "boolean",
+        "label": "Notify when a session's context is nearly full",
+        "defaultValue": true
+      },
+      {
+        "key": "contextWarnPct",
+        "type": "number",
+        "label": "Context warning threshold in % (50-99)",
+        "defaultValue": 80
+      },
+      {
+        "key": "alertJobs",
+        "type": "boolean",
+        "label": "Notify when a background job finishes or gets blocked",
+        "defaultValue": true
+      },
+      {
+        "key": "editor",
+        "type": "string",
+        "label": "Editor for 'open in editor': auto (Omarchy default), code, zed or nvim",
+        "defaultValue": "auto"
+      }
+    ]
+  }
+}

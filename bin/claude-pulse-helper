@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""Claude Pulse helper: reads Claude Code's local files and prints JSON.
+
+Subcommands (each prints exactly one JSON document and exits 0):
+  sessions            live Claude Code sessions with model, tokens, cost, subagents
+  scan                token/cost stats (today, 7 days, per project, per model) + recent sessions
+  usage [--force]     plan limits from the OAuth usage endpoint (cached, rate-limit aware)
+  status              status.claude.com summary (cached 5 minutes)
+  inventory           installed plugins, personal skills and MCP servers (read-only)
+
+Everything is read-only with respect to Claude Code. The helper writes only
+its own cache in ~/.cache/claude-pulse/. It never refreshes or rewrites the
+OAuth token: the `claude` CLI owns that file, and a rotated refresh token
+would log the CLI out.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+SESSIONS_DIR = os.path.join(CLAUDE, "sessions")
+PROJECTS_DIR = os.path.join(CLAUDE, "projects")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "claude-pulse")
+SCAN_CACHE = os.path.join(CACHE_DIR, "scan.json")
+SCAN_VERSION = 5
+ACT_KEEP = 120
+STATS_DAYS = 30
+UA = "claude-pulse/1.0"
+
+# ---------------------------------------------------------------- prices
+# USD per million tokens: input, output, cache read. Cache writes use the
+# standard multipliers (5 minutes 1.25x input, 1 hour 2x input). These are
+# API list prices, so a subscription "cost" is an API-equivalent estimate.
+PRICES = [
+    ("claude-fable-5-2", 8.0, 40.0, 0.20),
+    ("claude-mythos-5-2", 8.0, 40.0, 0.20),
+    ("claude-fable-5-1", 10.0, 50.0, 1.00),
+    ("claude-mythos-5-1", 10.0, 50.0, 1.00),
+    ("claude-fable-5", 10.0, 50.0, 1.00),
+    ("claude-mythos", 10.0, 50.0, 1.00),
+    ("claude-opus-5-5", 4.0, 20.0, 0.20),
+    ("claude-opus-5", 5.0, 25.0, 0.50),
+    ("claude-opus-4", 5.0, 25.0, 0.50),
+    ("claude-sonnet-5-5", 2.0, 10.0, 0.10),
+    ("claude-sonnet-5", 2.0, 10.0, 0.20),
+    ("claude-sonnet-4", 3.0, 15.0, 0.30),
+    ("claude-haiku-5-5", 0.10, 0.50, 0.01),
+    ("claude-haiku-4", 1.0, 5.0, 0.10),
+    ("claude-haiku", 1.0, 5.0, 0.10),
+]
+
+
+def price_for(model: str):
+    m = (model or "").lower()
+    for prefix, i, o, r in PRICES:
+        if m.startswith(prefix):
+            return i, o, r
+    return None
+
+
+def cost_of(model: str, t) -> float:
+    """t = [input, output, cache_write_5m, cache_write_1h, cache_read, messages]."""
+    p = price_for(model)
+    if not p:
+        return 0.0
+    i, o, r = p
+    return (t[0] * i + t[1] * o + t[2] * i * 1.25 + t[3] * i * 2.0 + t[4] * r) / 1e6
+
+
+def pretty_model(model: str) -> str:
+    m = re.match(r"claude-([a-z]+)-(\d+)(?:-(\d+))?", model or "")
+    if not m:
+        return model or ""
+    name = m.group(1).capitalize()
+    ver = m.group(2) + ("." + m.group(3) if m.group(3) and len(m.group(3)) <= 2 else "")
+    return f"{name} {ver}"
+
+
+# ---------------------------------------------------------------- utils
+
+def out(obj) -> None:
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")))
+    sys.stdout.write("\n")
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, separators=(",", ":"))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def iso_to_epoch(ts) -> float:
+    if not ts:
+        return 0.0
+    if isinstance(ts, (int, float)):
+        return ts / 1000.0 if ts > 1e11 else float(ts)
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+_day_cache: dict = {}
+
+
+def local_day(ts: str) -> str:
+    key = ts[:13]  # same hour -> same local day
+    d = _day_cache.get(key)
+    if d is None:
+        e = iso_to_epoch(ts)
+        d = datetime.fromtimestamp(e).strftime("%Y-%m-%d") if e else ""
+        _day_cache[key] = d
+    return d
+
+
+def clip(s, n=240) -> str:
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def parent_pid(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            data = f.read()
+        return int(data[data.rindex(")") + 2 :].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def pid_chain(pid: int, depth: int = 16) -> list:
+    chain = []
+    while pid > 1 and depth > 0 and pid not in chain:
+        chain.append(pid)
+        pid = parent_pid(pid)
+        depth -= 1
+    return chain
+
+
+def project_name(cwd: str) -> str:
+    cwd = (cwd or "").rstrip("/")
+    if not cwd:
+        return "?"
+    if cwd == HOME:
+        return "~"
+    return os.path.basename(cwd)
+
+
+# ---------------------------------------------------------------- transcript scanner
+#
+# Transcripts are append-only JSONL. We keep, per file, the byte offset we
+# have read up to plus running totals, so each poll reads only new lines.
+
+def new_state():
+    return {
+        "off": 0, "ino": 0, "mt": 0, "cwd": "", "sid": "", "title": "", "prompt": "",
+        "model": "", "branch": "", "ctx": 0, "agents": 0, "last": "", "first": "",
+        "lastmid": "", "days": {}, "act": [], "tool": None, "pending": None, "mode": "",
+    }
+
+
+def tool_detail(name: str, inp) -> str:
+    """A short, human description of a tool call."""
+    inp = inp if isinstance(inp, dict) else {}
+    n = name or ""
+    if n == "Bash":
+        cmd = str(inp.get("command") or "")
+        # "cd <dir> && real command": the directory is noise here.
+        cmd = re.sub(r"^\s*cd\s+(\"[^\"]*\"|'[^']*'|\S+)\s*&&\s*", "", cmd)
+        return clip(cmd, 90)
+    if n in ("Edit", "Write", "Read", "NotebookEdit", "MultiEdit"):
+        return os.path.basename(str(inp.get("file_path") or inp.get("notebook_path") or ""))
+    if n in ("Grep", "Glob"):
+        return clip(inp.get("pattern"), 60)
+    if n == "WebFetch":
+        m = re.match(r"https?://([^/]+)", str(inp.get("url") or ""))
+        return m.group(1) if m else ""
+    if n == "WebSearch":
+        return clip(inp.get("query"), 60)
+    if n in ("Agent", "Task"):
+        return clip(inp.get("description"), 60)
+    if n == "Skill":
+        return str(inp.get("skill") or inp.get("name") or "")
+    if n == "AskUserQuestion":
+        qs = inp.get("questions") or []
+        return clip(qs[0].get("question") if qs and isinstance(qs[0], dict) else "", 90)
+    if n == "ExitPlanMode":
+        return "plan ready"
+    if n.startswith("mcp__"):
+        parts = n.split("__")
+        return (parts[1] + ": " + "__".join(parts[2:])) if len(parts) > 2 else n
+    return ""
+
+
+def version_newer(a: str, b: str) -> bool:
+    """True when version a is newer than b (dotted numbers)."""
+    def nums(v):
+        return [int(x) for x in re.findall(r"\d+", str(v or ""))[:4]]
+    return nums(a) > nums(b)
+
+
+def tokens_of(usage: dict):
+    cc = usage.get("cache_creation") or {}
+    w1h = int(cc.get("ephemeral_1h_input_tokens") or 0)
+    w5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
+    total_w = int(usage.get("cache_creation_input_tokens") or 0)
+    if w1h + w5 == 0:
+        w5 = total_w
+    return [int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
+            w5, w1h, int(usage.get("cache_read_input_tokens") or 0)]
+
+
+def scan_file(path: str, st: dict, cutoff_day: str = "") -> dict:
+    try:
+        s = os.stat(path)
+    except OSError:
+        return st
+    if st.get("ino") != s.st_ino or s.st_size < st.get("off", 0):
+        st = new_state()
+    st["ino"] = s.st_ino
+    if s.st_size == st["off"]:
+        return st
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return st
+    with f:
+        f.seek(st["off"])
+        data = f.read()
+    end = data.rfind(b"\n")
+    if end < 0:
+        return st
+    st["off"] += end + 1
+    st["mt"] = s.st_mtime
+    for raw in data[: end + 1].splitlines():
+        if not raw:
+            continue
+        # Cheap pre-filter: most bytes are tool output we do not need.
+        head = raw[:400].replace(b'": "', b'":"')
+        if (b'"type":"assistant"' not in head and b'"assistant"' not in raw[:2000]
+                and b'"ai-title"' not in head and b'"last-prompt"' not in head and b'"type":"user"' not in head
+                and b'"permission-mode"' not in head):
+            continue
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            continue
+        t = o.get("type")
+        if o.get("cwd") and not st["cwd"]:
+            st["cwd"] = o["cwd"]
+        if o.get("sessionId") and not st["sid"]:
+            st["sid"] = o["sessionId"]
+        ts = o.get("timestamp") or ""
+        if ts:
+            if not st["first"]:
+                st["first"] = ts
+            st["last"] = ts
+        if o.get("permissionMode"):
+            st["mode"] = o["permissionMode"]
+        if t == "ai-title":
+            st["title"] = clip(o.get("aiTitle"), 120) or st["title"]
+        elif t == "last-prompt":
+            st["prompt"] = clip(o.get("lastPrompt")) or st["prompt"]
+        elif t == "user" and not o.get("isMeta") and not o.get("isSidechain"):
+            c0 = (o.get("message") or {}).get("content")
+            if isinstance(c0, list) and st.get("pending"):
+                for item in c0:
+                    if isinstance(item, dict) and item.get("type") == "tool_result" and item.get("tool_use_id") == st["pending"].get("id"):
+                        st["pending"] = None
+                        break
+            if o.get("gitBranch"):
+                st["branch"] = "" if o["gitBranch"] == "HEAD" else o["gitBranch"]
+            c = (o.get("message") or {}).get("content")
+            if isinstance(c, str) and c and not c.startswith("<"):
+                st["prompt"] = clip(c)
+        elif t == "assistant":
+            msg = o.get("message") or {}
+            model = msg.get("model") or ""
+            if model and model != "<synthetic>":
+                st["model"] = model
+            for c in msg.get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    if c.get("name") in ("Agent", "Task"):
+                        st["agents"] += 1
+                    call = {"id": c.get("id") or "", "tool": c.get("name") or "",
+                            "detail": tool_detail(c.get("name"), c.get("input")), "ts": round(iso_to_epoch(ts)) if ts else 0}
+                    st["tool"] = call
+                    st["pending"] = call
+            usage = msg.get("usage")
+            mid = msg.get("id") or o.get("requestId") or ""
+            if not usage or not model or model == "<synthetic>" or (mid and mid == st["lastmid"]):
+                continue
+            st["lastmid"] = mid
+            tk = tokens_of(usage)
+            st["ctx"] = tk[0] + tk[2] + tk[3] + tk[4]
+            if ts:
+                act = st.setdefault("act", [])
+                act.append([round(iso_to_epoch(ts)), tk[1]])
+                if len(act) > ACT_KEEP:
+                    del act[: len(act) - ACT_KEEP]
+            day = local_day(ts) if ts else ""
+            if not day or (cutoff_day and day < cutoff_day):
+                continue
+            bucket = st["days"].setdefault(day, {}).setdefault(model, [0, 0, 0, 0, 0, 0])
+            for k in range(5):
+                bucket[k] += tk[k]
+            bucket[5] += 1
+    return st
+
+
+class ScanCache:
+    """Locked, shared cache of per-file scan state."""
+
+    def __init__(self):
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        self.lock = open(os.path.join(CACHE_DIR, "scan.lock"), "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        data = read_json(SCAN_CACHE, {}) or {}
+        if data.get("v") != SCAN_VERSION:
+            data = {"v": SCAN_VERSION, "files": {}}
+        self.data = data
+        self.files = data["files"]
+        self.dirty = False
+
+    def get(self, path, cutoff_day=""):
+        st = self.files.get(path) or new_state()
+        before = (st.get("off"), st.get("ino"))
+        st = scan_file(path, st, cutoff_day)
+        if (st.get("off"), st.get("ino")) != before:
+            self.dirty = True
+        self.files[path] = st
+        return st
+
+    def close(self):
+        if self.dirty:
+            write_json(SCAN_CACHE, self.data)
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+        self.lock.close()
+
+
+def sum_days(st, model_filter=None):
+    """Totals across days: (tokens[6] per model dict, cost)."""
+    per = {}
+    for models in st.get("days", {}).values():
+        for model, t in models.items():
+            acc = per.setdefault(model, [0, 0, 0, 0, 0, 0])
+            for k in range(6):
+                acc[k] += t[k]
+    cost = sum(cost_of(m, t) for m, t in per.items())
+    return per, cost
+
+
+def tok_total(t):
+    return t[0] + t[1] + t[2] + t[3] + t[4]
+
+
+# ---------------------------------------------------------------- sessions
+
+def subagent_info(cache: ScanCache, project_dir: str, sid: str):
+    d = os.path.join(project_dir, sid, "subagents")
+    running, done, tokens, cost, active, acts = 0, 0, 0, 0.0, [], []
+    for meta_path in glob.glob(os.path.join(d, "*.meta.json")):
+        meta = read_json(meta_path, {}) or {}
+        jl = meta_path[: -len(".meta.json")] + ".jsonl"
+        if meta.get("finished"):
+            done += 1
+        else:
+            # A crashed run never writes "finished"; treat 10 quiet minutes as done.
+            try:
+                quiet = time.time() - os.stat(jl).st_mtime
+            except OSError:
+                quiet = 1e9
+            if quiet < 600:
+                running += 1
+                active.append({"type": meta.get("agentType") or "agent", "desc": clip(meta.get("description"), 80)})
+            else:
+                done += 1
+        if os.path.exists(jl):
+            st = cache.get(jl)
+            per, c = sum_days(st)
+            tokens += sum(tok_total(t) for t in per.values())
+            cost += c
+            acts.extend(st.get("act") or [])
+    return {"running": running, "done": done, "tokens": tokens, "cost": round(cost, 4), "active": active[:6]}, acts
+
+
+def spark(acts, now, minutes=30):
+    """Output tokens per minute for the last `minutes` minutes, oldest first."""
+    buckets = [0] * minutes
+    start = now - minutes * 60
+    for ts, n in acts:
+        if ts >= start:
+            i = min(minutes - 1, int((ts - start) // 60))
+            buckets[i] += n
+    return buckets
+
+
+def find_transcript(sid: str, cwd: str):
+    if not sid:
+        return None, None
+    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd or "")
+    direct = os.path.join(PROJECTS_DIR, slug, sid + ".jsonl")
+    if os.path.exists(direct):
+        return direct, os.path.join(PROJECTS_DIR, slug)
+    for p in glob.glob(os.path.join(PROJECTS_DIR, "*", sid + ".jsonl")):
+        return p, os.path.dirname(p)
+    return None, None
+
+
+def cmd_sessions():
+    rows = []
+    cache = ScanCache()
+    try:
+        for path in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+            d = read_json(path)
+            if not isinstance(d, dict):
+                continue
+            pid = int(d.get("pid") or 0)
+            if not pid_alive(pid):
+                continue
+            sid = d.get("sessionId") or ""
+            cwd = d.get("cwd") or ""
+            status = str(d.get("status") or "")
+            row = {
+                "pid": pid, "sessionId": sid, "cwd": cwd, "project": project_name(cwd),
+                "name": d.get("name") or "", "kind": d.get("kind") or "",
+                "status": "busy" if status == "busy" else "waiting", "rawStatus": status,
+                "since": int(d.get("statusUpdatedAt") or d.get("updatedAt") or d.get("startedAt") or 0) / 1000,
+                "startedAt": int(d.get("startedAt") or 0) / 1000,
+                "version": d.get("version") or "",
+                "chain": pid_chain(pid),
+                "title": "", "prompt": "", "model": "", "modelName": "", "branch": "",
+                "context": 0, "tokens": 0, "cost": 0.0, "turns": 0, "agentCalls": 0,
+                "models": [], "sub": {"running": 0, "done": 0, "tokens": 0, "cost": 0, "active": []},
+                "spark": [0] * 30, "rate": 0,
+                "doing": None, "approval": None, "waitKind": "", "mode": "", "outdated": False,
+            }
+            tpath, pdir = find_transcript(sid, cwd)
+            if tpath:
+                st = cache.get(tpath)
+                per, cost = sum_days(st)
+                row.update({
+                    "title": st["title"], "prompt": st["prompt"], "model": st["model"],
+                    "modelName": pretty_model(st["model"]), "branch": st["branch"],
+                    "context": st["ctx"], "agentCalls": st["agents"],
+                    "tokens": sum(tok_total(t) for t in per.values()),
+                    "turns": sum(t[5] for t in per.values()),
+                    "cost": round(cost, 4),
+                    "models": sorted({pretty_model(m) for m in per}),
+                })
+                row["sub"], acts = subagent_info(cache, pdir, sid)
+                now = time.time()
+                row["spark"] = spark((st.get("act") or []) + acts, now)
+                row["rate"] = round(sum(row["spark"][-5:]) / 5)
+                row["mode"] = st.get("mode") or ""
+                if row["status"] == "busy":
+                    row["doing"] = st.get("tool")
+                else:
+                    # Claude Code sets status "waiting" while a permission, question
+                    # or plan dialog is on screen ("idle" = the turn is over). The
+                    # tool call itself reaches the transcript only after you answer,
+                    # so the status is the signal and the transcript adds detail.
+                    pend = st.get("pending")
+                    if status == "waiting" or pend:
+                        call = dict(pend) if pend else {"tool": "", "detail": ""}
+                        call["id"] = (call.get("id") or "") + "@" + str(int(d.get("statusUpdatedAt") or 0))
+                        row["approval"] = call
+                        row["waitKind"] = ({"AskUserQuestion": "question", "ExitPlanMode": "plan"}.get(call.get("tool"))
+                                           or ("approval" if call.get("tool") else ("plan" if row["mode"] == "plan" else "input")))
+                    else:
+                        row["waitKind"] = "idle"
+            rows.append(row)
+    finally:
+        cache.close()
+    installed = (read_json(os.path.join(CACHE_DIR, "version.json"), {}) or {}).get("result", {}).get("local", "")
+    for r in rows:
+        r["outdated"] = bool(installed and r["version"] and version_newer(installed, r["version"]))
+    rows.sort(key=lambda r: (r["status"] != "waiting", r["since"] if r["status"] == "waiting" else -r["since"]))
+    out({"ok": True, "now": time.time(), "sessions": rows})
+
+
+# ---------------------------------------------------------------- background jobs
+
+def cmd_jobs(days: int = 7):
+    since = time.time() - days * 86400
+    rows = []
+    for path in glob.glob(os.path.join(CLAUDE, "jobs", "*", "state.json")):
+        d = read_json(path)
+        if not isinstance(d, dict):
+            continue
+        updated = iso_to_epoch(d.get("updatedAt"))
+        if updated < since:
+            continue
+        cwd = d.get("cwd") or ""
+        rows.append({
+            "id": os.path.basename(os.path.dirname(path)), "name": d.get("name") or d.get("daemonShort") or "job",
+            "state": str(d.get("state") or "unknown"), "detail": clip(d.get("detail"), 160), "needs": clip(d.get("needs"), 160),
+            "intent": clip(d.get("intent"), 160), "cwd": cwd, "project": project_name(cwd),
+            "tokens": int(d.get("tokens") or 0), "updatedAt": updated, "createdAt": iso_to_epoch(d.get("createdAt")),
+            "sessionId": d.get("resumeSessionId") or d.get("sessionId") or "",
+        })
+    rows.sort(key=lambda r: -r["updatedAt"])
+    out({"ok": True, "now": time.time(), "jobs": rows[:20]})
+
+
+# ---------------------------------------------------------------- version
+
+def cmd_version():
+    path = os.path.join(CACHE_DIR, "version.json")
+    cached = read_json(path, {}) or {}
+    now = time.time()
+    if now - cached.get("at", 0) < 6 * 3600 and cached.get("result", {}).get("local"):
+        return out(cached["result"])
+    local = ""
+    try:
+        import subprocess
+        res = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10)
+        m = re.search(r"\d+\.\d+\.\d+", res.stdout or "")
+        local = m.group(0) if m else ""
+    except (OSError, ValueError, Exception):
+        local = ""
+    latest = ""
+    try:
+        latest = str(http_json("https://registry.npmjs.org/@anthropic-ai/claude-code/latest").get("version") or "")
+    except (OSError, ValueError):
+        latest = cached.get("result", {}).get("latest", "")
+    result = {"ok": bool(local), "local": local, "latest": latest,
+              "update": bool(local and latest and version_newer(latest, local)), "at": now}
+    if local:
+        write_json(path, {"at": now, "result": result})
+    out(result)
+
+
+# ---------------------------------------------------------------- health
+
+def cmd_health():
+    creds = (read_json(os.path.join(CLAUDE, ".credentials.json"), {}) or {}).get("claudeAiOauth") or {}
+    auth = read_json(os.path.join(CLAUDE, "mcp-needs-auth-cache.json"), {}) or {}
+    mcp = []
+    for key, v in auth.items():
+        parts = str(key).split(":")
+        mcp.append({"key": key, "name": parts[-1], "source": parts[1] if len(parts) > 2 else "user",
+                    "since": (v or {}).get("timestamp", 0) / 1000 if isinstance(v, dict) else 0})
+    out({
+        "ok": True, "now": time.time(), "signedIn": bool(creds.get("accessToken")),
+        "tokenExpiresAt": (creds.get("expiresAt") or 0) / 1000,
+        "refreshExpiresAt": (creds.get("refreshTokenExpiresAt") or 0) / 1000,
+        "plan": str(creds.get("subscriptionType") or ""), "mcpNeedsAuth": mcp,
+    })
+
+
+# ---------------------------------------------------------------- scan (stats + recent)
+
+def cmd_scan():
+    today = datetime.now().date()
+    cutoff = (today - timedelta(days=STATS_DAYS - 1)).isoformat()
+    week = (today - timedelta(days=6)).isoformat()
+    since = time.time() - STATS_DAYS * 86400
+    cache = ScanCache()
+    days = {}          # day -> [tokens, cost]
+    models = {}        # model -> [tokens, cost, messages] (7 days)
+    projects = {}      # cwd -> {...} (7 days)
+    recent = []
+    try:
+        paths = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
+        paths += glob.glob(os.path.join(PROJECTS_DIR, "*", "*", "subagents", "*.jsonl"))
+        live = set()
+        for p in paths:
+            try:
+                if os.stat(p).st_mtime < since:
+                    continue
+            except OSError:
+                continue
+            live.add(p)
+            sub = "/subagents/" in p
+            st = cache.get(p, cutoff)
+            cwd = st.get("cwd") or ""
+            for day, per in st.get("days", {}).items():
+                if day < cutoff:
+                    continue
+                for model, t in per.items():
+                    c = cost_of(model, t)
+                    dd = days.setdefault(day, [0, 0.0])
+                    dd[0] += tok_total(t)
+                    dd[1] += c
+                    if day >= week:
+                        mm = models.setdefault(pretty_model(model), [0, 0.0, 0])
+                        mm[0] += tok_total(t)
+                        mm[1] += c
+                        mm[2] += t[5]
+                        pp = projects.setdefault(cwd, {"cwd": cwd, "project": project_name(cwd), "tokens": 0,
+                                                       "cost": 0.0, "sessions": set(), "models": {}, "subTokens": 0})
+                        pp["tokens"] += tok_total(t)
+                        pp["cost"] += c
+                        pp["models"][pretty_model(model)] = pp["models"].get(pretty_model(model), 0) + tok_total(t)
+                        if sub:
+                            pp["subTokens"] += tok_total(t)
+                        elif st.get("sid"):
+                            pp["sessions"].add(st["sid"])
+            if not sub and st.get("sid") and st.get("last"):
+                per, cost = sum_days(st)
+                if not per:
+                    continue  # opened and closed without a reply
+                recent.append({
+                    "sessionId": st["sid"], "cwd": cwd, "project": project_name(cwd),
+                    "title": st.get("title") or "", "prompt": st.get("prompt") or "",
+                    "model": pretty_model(st.get("model")), "branch": st.get("branch") or "",
+                    "last": iso_to_epoch(st["last"]), "first": iso_to_epoch(st.get("first")),
+                    "tokens": sum(tok_total(t) for t in per.values()), "cost": round(cost, 4),
+                })
+        # Forget files that aged out, so the cache does not grow forever.
+        for p in list(cache.files):
+            if p not in live and not os.path.exists(p):
+                del cache.files[p]
+                cache.dirty = True
+    finally:
+        cache.close()
+
+    chart = []
+    for i in range(6, -1, -1):
+        d = (today - timedelta(days=i)).isoformat()
+        tk, c = days.get(d, [0, 0.0])
+        chart.append({"day": d, "label": (today - timedelta(days=i)).strftime("%a"), "tokens": tk, "cost": round(c, 2)})
+    t_today = days.get(today.isoformat(), [0, 0.0])
+    t_week = [sum(c["tokens"] for c in chart), sum(c["cost"] for c in chart)]
+    t_month = [sum(v[0] for v in days.values()), sum(v[1] for v in days.values())]
+    proj = []
+    for p in projects.values():
+        top = sorted(p["models"].items(), key=lambda kv: -kv[1])
+        proj.append({"cwd": p["cwd"], "project": p["project"], "tokens": p["tokens"], "cost": round(p["cost"], 2),
+                     "sessions": len(p["sessions"]), "models": [m for m, _ in top[:3]], "subTokens": p["subTokens"]})
+    proj.sort(key=lambda r: -r["cost"])
+    mods = [{"model": m, "tokens": v[0], "cost": round(v[1], 2), "messages": v[2]} for m, v in models.items()]
+    mods.sort(key=lambda r: -r["cost"])
+    recent.sort(key=lambda r: -r["last"])
+    folders, seen = [], set()
+    for r in recent:
+        if r["cwd"] and r["cwd"] not in seen and os.path.isdir(r["cwd"]):
+            seen.add(r["cwd"])
+            folders.append({"cwd": r["cwd"], "project": r["project"], "last": r["last"]})
+    out({
+        "ok": True, "now": time.time(),
+        "today": {"tokens": t_today[0], "cost": round(t_today[1], 2)},
+        "week": {"tokens": t_week[0], "cost": round(t_week[1], 2)},
+        "month": {"tokens": t_month[0], "cost": round(t_month[1], 2), "days": STATS_DAYS},
+        "chart": chart, "projects": proj[:12], "models": mods,
+        "recent": recent[:150], "folders": folders[:20],
+    })
+
+
+# ---------------------------------------------------------------- usage
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+WINDOW_SECONDS = {"session": 5 * 3600, "weekly": 7 * 86400}
+
+
+def http_json(url, headers=None, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as f:
+        if int(f.headers.get("Content-Length") or 0) > 4 * 1024 * 1024:
+            raise ValueError("response too large")
+        return json.loads(f.read(4 * 1024 * 1024))
+
+
+def normalise_usage(raw: dict) -> dict:
+    windows = []
+    for lim in raw.get("limits") or []:
+        kind = lim.get("kind") or ""
+        group = lim.get("group") or ("session" if "session" in kind else "weekly")
+        scope = ((lim.get("scope") or {}).get("model") or {}).get("display_name") or ""
+        if kind == "session":
+            label, wid = "Session", "session"
+        elif kind == "weekly_all":
+            label, wid = "Weekly", "weekly"
+        else:
+            label, wid = ("Weekly · " + scope) if scope else "Weekly · " + kind.replace("_", " "), "model:" + (scope or kind)
+        windows.append({"id": wid, "label": label, "group": group, "pct": float(lim.get("percent") or 0),
+                        "resetsAt": iso_to_epoch(lim.get("resets_at")), "windowSec": WINDOW_SECONDS.get(group, 7 * 86400),
+                        "severity": lim.get("severity") or "", "active": bool(lim.get("is_active"))})
+    if not windows:
+        for key, wid, label, group in (("five_hour", "session", "Session", "session"),
+                                       ("seven_day", "weekly", "Weekly", "weekly"),
+                                       ("seven_day_opus", "model:Opus", "Weekly · Opus", "weekly"),
+                                       ("seven_day_sonnet", "model:Sonnet", "Weekly · Sonnet", "weekly")):
+            w = raw.get(key)
+            if isinstance(w, dict) and w.get("utilization") is not None:
+                windows.append({"id": wid, "label": label, "group": group, "pct": float(w["utilization"]),
+                                "resetsAt": iso_to_epoch(w.get("resets_at")), "windowSec": WINDOW_SECONDS[group],
+                                "severity": "", "active": False})
+    breakdown = [{"key": r.get("key"), "label": r.get("display_name"), "pct": r.get("percent") or 0}
+                 for r in ((raw.get("seven_day_breakdown") or {}).get("rows") or [])]
+    spend = raw.get("spend") or {}
+    used = spend.get("used") or {}
+    extra = None
+    if spend.get("enabled"):
+        exp = 10 ** int(used.get("exponent") or 2)
+        lim = spend.get("limit") or {}
+        bal = spend.get("balance") or {}
+        extra = {"used": (used.get("amount_minor") or 0) / exp, "currency": used.get("currency") or "USD",
+                 "limit": (lim.get("amount_minor") / exp) if isinstance(lim, dict) and lim.get("amount_minor") is not None else None,
+                 "balance": (bal.get("amount_minor") / exp) if isinstance(bal, dict) and bal.get("amount_minor") is not None else None,
+                 "pct": spend.get("percent")}
+    return {"windows": windows, "breakdown": breakdown, "extra": extra}
+
+
+def cmd_usage(force: bool):
+    path = os.path.join(CACHE_DIR, "usage.json")
+    cached = read_json(path, {}) or {}
+    now = time.time()
+    min_age = 60 if force else 240
+    creds = (read_json(os.path.join(CLAUDE, ".credentials.json"), {}) or {}).get("claudeAiOauth") or {}
+    plan = str(creds.get("subscriptionType") or "").capitalize()
+    result = dict(cached.get("result") or {"windows": [], "breakdown": [], "extra": None})
+    meta = {"plan": plan, "updatedAt": cached.get("at", 0), "stale": False, "error": "", "retryAt": cached.get("retryAt", 0)}
+
+    def finish(error="", stale=False):
+        meta["error"] = error
+        meta["stale"] = stale or bool(error)
+        out({"ok": not error or bool(result.get("windows")), **result, **meta, "now": now})
+
+    if now < cached.get("retryAt", 0):
+        return finish("rate limited", True)
+    if now - cached.get("at", 0) < min_age and result.get("windows"):
+        return finish()
+    token = creds.get("accessToken")
+    if not token:
+        return finish("not logged in: run claude")
+    if creds.get("expiresAt") and creds["expiresAt"] / 1000 < now:
+        return finish("token expired: open claude once to refresh it", True)
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(CACHE_DIR, "usage.lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        cached = read_json(path, {}) or {}
+        if now - cached.get("at", 0) < min_age and cached.get("result", {}).get("windows"):
+            result = cached["result"]
+            meta["updatedAt"] = cached["at"]
+            return finish()
+        try:
+            raw = http_json(USAGE_URL, {"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"})
+            result = normalise_usage(raw)
+            cached = {"at": now, "result": result, "retryAt": 0}
+            write_json(path, cached)
+            meta["updatedAt"] = now
+            meta["retryAt"] = 0
+            return finish()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                try:
+                    wait = int(e.headers.get("Retry-After") or 600)
+                except ValueError:
+                    wait = 600
+                cached["retryAt"] = now + max(60, min(wait, 6 * 3600))
+                write_json(path, cached)
+                meta["retryAt"] = cached["retryAt"]
+                return finish("rate limited", True)
+            if e.code in (401, 403):
+                return finish("signed out: run claude to log in", True)
+            return finish(f"HTTP {e.code}", True)
+        except (OSError, ValueError) as e:
+            return finish("offline" if isinstance(e, urllib.error.URLError) else "bad response", True)
+
+
+# ---------------------------------------------------------------- status
+
+def cmd_status():
+    path = os.path.join(CACHE_DIR, "status.json")
+    cached = read_json(path, {}) or {}
+    now = time.time()
+    if now - cached.get("at", 0) < 270 and "result" in cached:
+        return out(cached["result"])
+    try:
+        raw = http_json("https://status.claude.com/api/v2/summary.json")
+        st = raw.get("status") or {}
+        incidents = [{"name": clip(i.get("name"), 120), "status": i.get("status"), "impact": i.get("impact"),
+                      "url": i.get("shortlink") or "https://status.claude.com"}
+                     for i in raw.get("incidents") or []]
+        degraded = [c.get("name") for c in raw.get("components") or []
+                    if c.get("status") not in (None, "operational") and not c.get("group")]
+        result = {"ok": True, "indicator": st.get("indicator") or "none", "description": st.get("description") or "",
+                  "incidents": incidents[:5], "degraded": degraded[:8], "at": now}
+        write_json(path, {"at": now, "result": result})
+        out(result)
+    except (OSError, ValueError):
+        res = cached.get("result") or {"ok": False, "indicator": "unknown", "description": "", "incidents": [], "degraded": []}
+        res = {**res, "ok": False}
+        out(res)
+
+
+# ---------------------------------------------------------------- inventory
+
+def frontmatter(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read(8192)
+    except OSError:
+        return {}
+    m = re.match(r"---\s*\n(.*?)\n---", text, re.S)
+    if not m:
+        return {}
+    meta, key = {}, None
+    for line in m.group(1).splitlines():
+        mm = re.match(r"([A-Za-z_-]+):\s*(.*)", line)
+        if mm:
+            key = mm.group(1)
+            val = mm.group(2).strip()
+            meta[key] = "" if val in (">", "|", ">-", "|-") else val.strip("\"'")
+        elif key and line.startswith((" ", "\t")):
+            meta[key] = (meta[key] + " " + line.strip()).strip()
+    return meta
+
+
+def cmd_inventory():
+    settings = read_json(os.path.join(CLAUDE, "settings.json"), {}) or {}
+    enabled = settings.get("enabledPlugins") or {}
+    installed = (read_json(os.path.join(CLAUDE, "plugins", "installed_plugins.json"), {}) or {}).get("plugins") or {}
+    plugins = []
+    for key, entries in installed.items():
+        e = entries[0] if entries else {}
+        ipath = e.get("installPath") or ""
+        manifest = read_json(os.path.join(ipath, ".claude-plugin", "plugin.json"), {}) or {}
+        listed = manifest.get("skills") if isinstance(manifest.get("skills"), list) else None
+        if listed:
+            skills = sorted(os.path.basename(str(x).rstrip("/")) for x in listed)
+        else:
+            skills = sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(ipath, "skills", "*", "SKILL.md")))
+        commands = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(ipath, "commands", "*.md")))
+        agents = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(ipath, "agents", "*.md")))
+        mcp = read_json(os.path.join(ipath, ".mcp.json"), {}) or {}
+        mcp = list((mcp.get("mcpServers") or mcp).keys()) if isinstance(mcp, dict) else []
+        name, _, market = key.partition("@")
+        plugins.append({"name": name, "market": market, "version": str(e.get("version") or "")[:12],
+                        "enabled": enabled.get(key, True) is not False, "skills": skills, "commands": commands,
+                        "agents": agents, "mcp": mcp})
+    plugins.sort(key=lambda p: p["name"])
+    skills = []
+    for p in sorted(glob.glob(os.path.join(CLAUDE, "skills", "*", "SKILL.md"))):
+        meta = frontmatter(p)
+        skills.append({"name": meta.get("name") or os.path.basename(os.path.dirname(p)),
+                       "description": clip(meta.get("description"), 160)})
+    cfg = read_json(os.path.join(HOME, ".claude.json"), {}) or {}
+    mcp = [{"name": k, "scope": "user", "type": (v or {}).get("type") or ("stdio" if (v or {}).get("command") else "http")}
+           for k, v in (cfg.get("mcpServers") or {}).items()]
+    for p in plugins:
+        for k in p["mcp"]:
+            mcp.append({"name": k, "scope": "plugin:" + p["name"], "type": ""})
+    out({"ok": True, "plugins": plugins, "skills": skills, "mcp": mcp})
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    # Screenshot mode: with ~/.cache/claude-pulse/demo.json present, every
+    # command answers from that file instead of your real data.
+    demo = read_json(os.path.join(CACHE_DIR, "demo.json"))
+    if isinstance(demo, dict) and cmd in demo:
+        out(demo[cmd])
+        return 0
+    try:
+        if cmd == "sessions":
+            cmd_sessions()
+        elif cmd == "scan":
+            cmd_scan()
+        elif cmd == "usage":
+            cmd_usage("--force" in argv)
+        elif cmd == "status":
+            cmd_status()
+        elif cmd == "inventory":
+            cmd_inventory()
+        elif cmd == "jobs":
+            cmd_jobs(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 7)
+        elif cmd == "version":
+            cmd_version()
+        elif cmd == "health":
+            cmd_health()
+        else:
+            out({"ok": False, "error": "usage: claude-pulse-helper sessions|scan|usage|status|inventory|jobs|version|health"})
+    except Exception as e:  # never break the bar: errors are data
+        out({"ok": False, "error": f"{type(e).__name__}: {e}"})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
