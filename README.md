@@ -121,7 +121,7 @@ Costs are **API-equivalent estimates** (list prices, cache reads and writes incl
 
 ### Setup
 
-![Setup](assets/screenshots/setup.png)
+![Setup](assets/screenshots/health.png)
 
 **Health**
 
