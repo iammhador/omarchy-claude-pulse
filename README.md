@@ -94,7 +94,7 @@ Below the sessions, **Background jobs** (from `claude --bg` and scheduled runs) 
 
 Your plan limits, straight from Claude: the **5-hour session**, the **weekly** limit, and any **per-model** weekly limit (for example Fable).
 
-Each meter is a thermometer from sage through amber to red. The **white mark** is where an even burn rate would be; if the fill is past it you are ahead of pace. Under each meter are the pace (`↑ 21 pts ahead · runs out in 1h 53m`) and the countdown to the reset.
+Each meter is a thermometer from sage through amber to red. The **white mark** is where an even burn rate would be; if the fill is past it you are ahead of pace. Under each meter are the pace (`↑ 21 pts ahead · runs out in 1h 53m`) and the countdown to the reset. Weekly meters also show a **daily allowance** (`≈15% a day keeps you within this limit`): what is left, spread evenly over the days until the reset.
 
 Below: **this week by surface** (Claude Code, chats, Cowork) and your extra-usage credit if you have it. The footer says when the data was fetched; it refreshes every 5 minutes, because the endpoint is rate-limited.
 

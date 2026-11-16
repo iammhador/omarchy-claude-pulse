@@ -30,6 +30,16 @@ assert.strictEqual(M.pace({ pct: 48, windowSec: 18000, resetsAt: now + 9000 }, n
 assert.strictEqual(M.pace({ pct: 10, windowSec: 18000, resetsAt: now + 9000 }, now).arrow, "↓")
 assert.strictEqual(M.pace({ pct: 10 }, now).state, "unknown")
 
+// dailyAllowance: weekly only, at least a day left, not used up
+const wk = { windowSec: 604800 }
+assert.strictEqual(Math.round(M.dailyAllowance({ ...wk, pct: 40, resetsAt: now + 4 * 86400 }, now).perDay), 15)
+assert.strictEqual(M.dailyAllowance({ ...wk, pct: 40, resetsAt: now + 4 * 86400 }, now).daysLeft, 4)
+assert.strictEqual(M.dailyAllowance({ ...wk, pct: 100, resetsAt: now + 4 * 86400 }, now), null)
+assert.strictEqual(M.dailyAllowance({ ...wk, pct: 40, resetsAt: now + 3600 }, now), null)
+assert.strictEqual(M.dailyAllowance({ windowSec: 18000, pct: 40, resetsAt: now + 9000 }, now), null)
+assert.strictEqual(M.dailyAllowance({ ...wk, pct: 40 }, now), null)
+assert.strictEqual(M.dailyAllowance(null, now), null)
+
 // Formatting.
 assert.strictEqual(M.duration(59), "59s")
 assert.strictEqual(M.duration(5400), "1h 30m")

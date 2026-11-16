@@ -2058,6 +2058,15 @@ BarWidget {
         color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
       }
     }
+    Text {
+      readonly property var a: Model.dailyAllowance(lm.w, root.now)
+      visible: a !== null
+      width: parent.width
+      textFormat: Text.PlainText
+      text: a ? "≈" + (a.perDay < 1 ? "<1" : Math.floor(a.perDay)) + "% a day keeps you within this limit" : ""
+      color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
   }
 
   // Folders to start a session in: pinned first. Left click picks, right click pins.

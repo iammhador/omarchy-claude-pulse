@@ -174,6 +174,17 @@ function pace(win, now, tolerance) {
   return { elapsed: elapsed, delta: delta, arrow: arrow, state: state, runsOutIn: eta, runsOutBeforeReset: eta > 0 && eta < left }
 }
 
+// For a weekly window: how many points a day you can spend and still last
+// until the reset. Null when it does not apply (not weekly, used up, or less
+// than a day left, where the reset countdown says it better).
+function dailyAllowance(win, now) {
+  if (!win || Number(win.windowSec) !== 604800 || !win.resetsAt) return null
+  var used = Number(win.pct) || 0
+  var days = ((Number(win.resetsAt) || 0) - now) / 86400
+  if (used >= 100 || days < 1) return null
+  return { perDay: (100 - used) / days, daysLeft: days }
+}
+
 // ---------------------------------------------------------------- formatting
 
 function duration(sec) {
@@ -492,7 +503,7 @@ function truthy(v, fallback) {
 }
 
 var EXPORTS = {
-  parseTheme: parseTheme, mix: mix, gaugeColor: gaugeColor, level: level, pace: pace,
+  parseTheme: parseTheme, mix: mix, gaugeColor: gaugeColor, level: level, pace: pace, dailyAllowance: dailyAllowance,
   duration: duration, tokens: tokens, cost: cost, ago: ago, shortPath: shortPath, contextLimit: contextLimit,
   sortSessions: sortSessions, waitingCount: waitingCount, busyCount: busyCount, windowFor: windowFor,
   sessionAlerts: sessionAlerts, limitAlerts: limitAlerts, barWindow: barWindow,
