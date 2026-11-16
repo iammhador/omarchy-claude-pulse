@@ -94,7 +94,7 @@ Below the sessions, **Background jobs** (from `claude --bg` and scheduled runs) 
 
 Your plan limits, straight from Claude: the **5-hour session**, the **weekly** limit, and any **per-model** weekly limit (for example Fable).
 
-Each meter is a thermometer from sage through amber to red. The **white mark** is where an even burn rate would be; if the fill is past it you are ahead of pace. Under each meter are the pace (`↑ 21 pts ahead · runs out in 1h 53m`) and the countdown to the reset. Weekly meters also show a **daily allowance** (`≈15% a day keeps you within this limit`): what is left, spread evenly over the days until the reset.
+Each meter is a thermometer from sage through amber to red. The **white mark** is where an even burn rate would be; if the fill is past it you are ahead of pace. Under each meter are the pace (`↑ 21 pts ahead · at this rate: 100% 14:20`) and the countdown to the reset. The **forecast** uses your recent burn rate (the last 2 hours for the session, the last day for weekly), from the readings Claude Pulse saves each time it fetches usage; it shows only when you would hit 100% before the reset. Until there are two readings ten minutes apart, it estimates from the whole window instead (`runs out in 1h 53m`). Weekly meters also show a **daily allowance** (`≈15% a day keeps you within this limit`): what is left, spread evenly over the days until the reset.
 
 Below: **this week by surface** (Claude Code, chats, Cowork) and your extra-usage credit if you have it. The footer says when the data was fetched; it refreshes every 5 minutes, because the endpoint is rate-limited.
 
@@ -307,7 +307,7 @@ The session registry, transcripts, jobs and usage endpoint are internal to Claud
 
 ## Privacy
 
-Everything stays on your computer. Claude Pulse makes only three kinds of request: the usage endpoint (to Anthropic, with your own token), status.claude.com, and the npm registry for the latest Claude Code version. It writes only to its own folders, `~/.cache/claude-pulse/` and `~/.local/state/claude-pulse/` (pins and the alert log). It never changes Claude Code's files.
+Everything stays on your computer. Claude Pulse makes only three kinds of request: the usage endpoint (to Anthropic, with your own token), status.claude.com, and the npm registry for the latest Claude Code version. It writes only to its own folders, `~/.cache/claude-pulse/` (caches, and your usage percentages over the last 8 days for the forecast) and `~/.local/state/claude-pulse/` (pins and the alert log). It never changes Claude Code's files.
 
 ## Troubleshooting
 

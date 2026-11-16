@@ -174,6 +174,22 @@ function pace(win, now, tolerance) {
   return { elapsed: elapsed, delta: delta, arrow: arrow, state: state, runsOutIn: eta, runsOutBeforeReset: eta > 0 && eta < left }
 }
 
+// When a window reaches 100% at its recent burn rate, from saved readings
+// ([[time, pct], ...], oldest first). Null with too little data (under two
+// readings or under 10 minutes apart); then the pace estimate stands.
+function forecast(samples, win, now) {
+  var s = (samples || []).filter(function(p) { return p && p.length === 2 && p[0] <= now })
+  if (!win || s.length < 2) return null
+  var a = s[0], b = s[s.length - 1]
+  var span = b[0] - a[0]
+  var used = Number(win.pct) || 0
+  if (span < 600 || used >= 100) return null
+  var rate = (b[1] - a[1]) / span
+  if (rate <= 0) return { rate: 0, hitsAt: 0, beforeReset: false }
+  var hitsAt = now + (100 - used) / rate
+  return { rate: rate, hitsAt: hitsAt, beforeReset: !!win.resetsAt && hitsAt < win.resetsAt }
+}
+
 // For a weekly window: how many points a day you can spend and still last
 // until the reset. Null when it does not apply (not weekly, used up, or less
 // than a day left, where the reset countdown says it better).
@@ -503,7 +519,7 @@ function truthy(v, fallback) {
 }
 
 var EXPORTS = {
-  parseTheme: parseTheme, mix: mix, gaugeColor: gaugeColor, level: level, pace: pace, dailyAllowance: dailyAllowance,
+  parseTheme: parseTheme, mix: mix, gaugeColor: gaugeColor, level: level, pace: pace, forecast: forecast, dailyAllowance: dailyAllowance,
   duration: duration, tokens: tokens, cost: cost, ago: ago, shortPath: shortPath, contextLimit: contextLimit,
   sortSessions: sortSessions, waitingCount: waitingCount, busyCount: busyCount, windowFor: windowFor,
   sessionAlerts: sessionAlerts, limitAlerts: limitAlerts, barWindow: barWindow,

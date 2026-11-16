@@ -30,6 +30,20 @@ assert.strictEqual(M.pace({ pct: 48, windowSec: 18000, resetsAt: now + 9000 }, n
 assert.strictEqual(M.pace({ pct: 10, windowSec: 18000, resetsAt: now + 9000 }, now).arrow, "↓")
 assert.strictEqual(M.pace({ pct: 10 }, now).state, "unknown")
 
+// forecast: recent rate from saved readings
+const ses = { windowSec: 18000, pct: 50, resetsAt: now + 3 * 3600 }
+const rising = [[now - 3600, 30], [now - 1800, 40], [now, 50]]   // 20 pts an hour
+const fc = M.forecast(rising, ses, now)
+assert.strictEqual(Math.round(fc.hitsAt - now), 9000)           // 50 pts left = 2.5 h
+assert.strictEqual(fc.beforeReset, true)                         // reset is in 3 h
+assert.strictEqual(M.forecast(rising, { ...ses, resetsAt: now + 3600 }, now).beforeReset, false) // resets first
+assert.strictEqual(M.forecast([[now - 3600, 20], [now, 50]], { ...ses, resetsAt: now + 3 * 3600 }, now).beforeReset, true) // 30/h: 1h 40m
+assert.strictEqual(M.forecast([[now - 3600, 50], [now, 50]], ses, now).beforeReset, false)   // flat
+assert.strictEqual(M.forecast([[now, 50]], ses, now), null)                                 // one reading
+assert.strictEqual(M.forecast([[now - 120, 49], [now, 50]], ses, now), null)                // under 10 min
+assert.strictEqual(M.forecast(rising, { ...ses, pct: 100 }, now), null)                     // used up
+assert.strictEqual(M.forecast(undefined, ses, now), null)
+
 // dailyAllowance: weekly only, at least a day left, not used up
 const wk = { windowSec: 604800 }
 assert.strictEqual(Math.round(M.dailyAllowance({ ...wk, pct: 40, resetsAt: now + 4 * 86400 }, now).perDay), 15)
