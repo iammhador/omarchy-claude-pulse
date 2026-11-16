@@ -101,7 +101,10 @@ demo = {
     "sessions": {"ok": True, "now": now, "sessions": sessions},
     "usage": {"ok": True, "windows": windows,
               "breakdown": [{"key": "claude_code", "label": "Claude Code", "pct": 81}, {"key": "chat", "label": "Chats", "pct": 14}, {"key": "cowork", "label": "Cowork", "pct": 5}],
-              "extra": None, "plan": "Max", "updatedAt": now - 40, "stale": False, "error": "", "retryAt": 0, "now": now},
+              "extra": None, "plan": "Max", "updatedAt": now - 40, "stale": False, "error": "", "retryAt": 0, "now": now,
+              # Readings for the forecast: the session climbs 20 pts an hour, so it hits 100% before the reset.
+              "history": {"session": [[now - 5400 + i * 300, 12.0 + i * 300 * 20 / 3600] for i in range(19)],
+                          "weekly": [[now - 86400 + i * 3600, 48.0 + i * 10 / 24] for i in range(25)]}},
     "scan": {"ok": True, "now": now, "today": {"tokens": 61_000_000, "cost": 25.6}, "week": {"tokens": 236_000_000, "cost": 97.8},
              "month": {"tokens": 1_020_000_000, "cost": 412.0, "days": 30}, "chart": days, "projects": projects,
              "models": [{"model": "Opus 5.5", "tokens": 150_000_000, "cost": 61.0, "messages": 920},

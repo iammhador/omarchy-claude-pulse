@@ -1983,6 +1983,13 @@ BarWidget {
     id: lm
     property var w: ({})
     readonly property var p: Model.pace(w, root.now)
+    // The recent burn rate from saved readings; null until there are enough.
+    readonly property var f: Model.forecast(((root.usage.history || {})[w.id]) || [], w, root.now)
+    readonly property string runsOut: f
+      ? (f.beforeReset ? "at this rate: 100% " + (f.hitsAt - root.now < 86400 && new Date(f.hitsAt * 1000).getDate() === new Date(root.now * 1000).getDate()
+                                                 ? Qt.formatDateTime(new Date(f.hitsAt * 1000), "HH:mm")
+                                                 : Qt.formatDateTime(new Date(f.hitsAt * 1000), "ddd HH:mm")) : "")
+      : (p.runsOutBeforeReset ? "runs out in " + Model.duration(p.runsOutIn) : "")
     readonly property color c: root.gauge(w.pct)
     readonly property string scope: String(w.id || "").indexOf("model:") === 0 ? String(w.id).slice(6) : ""
     spacing: Style.space(7)
@@ -2047,7 +2054,7 @@ BarWidget {
         textFormat: Text.PlainText
         text: lm.p.state === "unknown" ? "" : lm.p.arrow + " " + (lm.p.state === "on" ? "on pace"
               : Math.abs(lm.p.delta) + " pts " + (lm.p.delta > 0 ? "ahead" : "under"))
-              + (lm.p.runsOutBeforeReset ? "  ·  runs out in " + Model.duration(lm.p.runsOutIn) : "")
+              + (lm.runsOut ? "  ·  " + lm.runsOut : "")
         color: lm.p.state === "hot" ? root.urgentColor : lm.p.state === "ahead" ? root.pal.yellow : root.dim
         font.family: root.fontFamily; font.pixelSize: Style.font.caption
       }
@@ -2057,6 +2064,15 @@ BarWidget {
         text: lm.w.resetsAt ? "resets in " + Model.duration(lm.w.resetsAt - root.now) : ""
         color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
       }
+    }
+    Text {
+      readonly property var a: Model.dailyAllowance(lm.w, root.now)
+      visible: a !== null
+      width: parent.width
+      textFormat: Text.PlainText
+      text: a ? "≈" + (a.perDay < 1 ? "<1" : Math.floor(a.perDay)) + "% a day keeps you within this limit" : ""
+      color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
     }
   }
 

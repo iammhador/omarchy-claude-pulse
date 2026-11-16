@@ -736,6 +736,41 @@ def normalise_usage(raw: dict) -> dict:
     return {"windows": windows, "breakdown": breakdown, "extra": extra}
 
 
+HISTORY_KEEP = 8 * 86400
+HISTORY_GAP = 60
+# How far back the forecast looks: the recent burn rate, not the whole window.
+HISTORY_LOOKBACK = {"session": 2 * 3600, "weekly": 24 * 3600}
+
+
+def record_history(now: float, windows: list) -> None:
+    """Keep one reading per fetch, for the forecast. Only percentages and times."""
+    path = os.path.join(CACHE_DIR, "usage-history.json")
+    hist = read_json(path, []) or []
+    if not isinstance(hist, list):
+        hist = []
+    if hist and now - (hist[-1].get("t") or 0) < HISTORY_GAP:
+        return
+    hist = [h for h in hist if isinstance(h, dict) and now - (h.get("t") or 0) < HISTORY_KEEP]
+    hist.append({"t": now, "w": {w["id"]: w["pct"] for w in windows}})
+    write_json(path, hist)
+
+
+def history_for(now: float, windows: list) -> dict:
+    """Recent [time, pct] readings for each window, within its current period."""
+    hist = read_json(os.path.join(CACHE_DIR, "usage-history.json"), []) or []
+    if not isinstance(hist, list):
+        return {}
+    res = {}
+    for w in windows:
+        start = max((w.get("resetsAt") or 0) - (w.get("windowSec") or 0),
+                    now - HISTORY_LOOKBACK.get(w.get("group"), 24 * 3600))
+        pts = [[h["t"], h["w"][w["id"]]] for h in hist
+               if isinstance(h, dict) and (h.get("t") or 0) >= start and w["id"] in (h.get("w") or {})]
+        if pts:
+            res[w["id"]] = pts
+    return res
+
+
 def cmd_usage(force: bool):
     path = os.path.join(CACHE_DIR, "usage.json")
     cached = read_json(path, {}) or {}
@@ -749,7 +784,8 @@ def cmd_usage(force: bool):
     def finish(error="", stale=False):
         meta["error"] = error
         meta["stale"] = stale or bool(error)
-        out({"ok": not error or bool(result.get("windows")), **result, **meta, "now": now})
+        out({"ok": not error or bool(result.get("windows")), **result, **meta, "now": now,
+             "history": history_for(now, result.get("windows") or [])})
 
     if now < cached.get("retryAt", 0):
         return finish("rate limited", True)
@@ -773,6 +809,7 @@ def cmd_usage(force: bool):
             result = normalise_usage(raw)
             cached = {"at": now, "result": result, "retryAt": 0}
             write_json(path, cached)
+            record_history(now, result["windows"])
             meta["updatedAt"] = now
             meta["retryAt"] = 0
             return finish()

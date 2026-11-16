@@ -191,6 +191,27 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(u["breakdown"][0]["pct"], 93)
         self.assertIsNone(u["extra"])
 
+    def test_history_recorded_and_trimmed(self):
+        old = H.CACHE_DIR
+        H.CACHE_DIR = tempfile.mkdtemp()
+        try:
+            now = 1_800_000_000
+            ses = {"id": "session", "group": "session", "pct": 30.0, "resetsAt": now + 3600, "windowSec": 18000}
+            wk = {"id": "weekly", "group": "weekly", "pct": 50.0, "resetsAt": now + 3 * 86400, "windowSec": 604800}
+            H.record_history(now - 9 * 86400, [dict(ses, pct=1.0)])      # older than 8 days: dropped later
+            H.record_history(now - 3 * 3600, [dict(ses, pct=5.0), wk])  # before this session window
+            H.record_history(now - 1800, [dict(ses, pct=20.0), wk])
+            H.record_history(now - 1790, [dict(ses, pct=21.0), wk])     # under a minute later: skipped
+            H.record_history(now, [ses, wk])
+            hist = H.read_json(os.path.join(H.CACHE_DIR, "usage-history.json"))
+            self.assertEqual(len(hist), 3)
+            self.assertTrue(all(now - h["t"] < 8 * 86400 for h in hist))
+            got = H.history_for(now, [ses, wk])
+            self.assertEqual(got["session"], [[now - 1800, 20.0], [now, 30.0]])
+            self.assertEqual(len(got["weekly"]), 3)
+        finally:
+            H.CACHE_DIR = old
+
     def test_legacy_shape(self):
         u = H.normalise_usage({"five_hour": {"utilization": 42.0, "resets_at": "2026-11-12T21:00:00Z"},
                                "seven_day": {"utilization": 7.0, "resets_at": None}})
