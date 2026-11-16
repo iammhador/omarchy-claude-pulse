@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.iammhador.claude-pulse",
   "name": "Claude Pulse",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "author": "iammhador",
   "license": "MIT",
   "description": "Claude Code in the Omarchy bar: plan limits with pace, every running session with what it is doing now, approvals, model, tokens, cost, subagents and context; a tune when Claude finishes; clickable alerts; a quick prompt launcher with pinned projects; background jobs; 30-day stats; searchable history with one-click resume; and a health check for updates, sign-in and MCP servers.",
